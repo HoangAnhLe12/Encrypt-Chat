@@ -1,5 +1,7 @@
 'use strict'
 
+/** ******* Imports ********/
+
 const {
   bufferToString,
   genRandomSalt,
@@ -14,6 +16,15 @@ const {
   cryptoKeyToJSON, // async
   govEncryptionDataStr
 } = require('./lib')
+
+/** ******* Implementation ********/
+
+"use strict";
+
+/********* Imports ********/
+
+
+
 class MessengerClient {
   constructor(certAuthorityPublicKey, govPublicKey) {
       // the certificate authority DSA public key is used to
@@ -28,6 +39,15 @@ class MessengerClient {
 
     };
 
+  /**
+   * Generate a certificate to be stored with the certificate authority.
+   * The certificate must contain the field "username".
+   *
+   * Arguments:
+   *   username: string
+   *
+   * Return Type: certificate object/dictionary
+   */ 
   async generateCertificate(username) {
     const certificate = {};
     certificate.username = username;
@@ -38,6 +58,16 @@ class MessengerClient {
     this.myKeyPairs = {cert_pk: key_pair.pub, cert_sk: key_pair.sec};
     return certificate;
   }
+
+  /**
+   * Receive and store another user's certificate.
+   *
+   * Arguments:
+   *   certificate: certificate object/dictionary
+   *   signature: string
+   *
+   * Return Type: void
+   */
   async receiveCertificate(certificate, signature) {
     //check this is a valid signature on the certificate
 
@@ -45,6 +75,16 @@ class MessengerClient {
     if(!valid) throw("invalid signature provided");
     this.certs[certificate.username] = certificate;
   }
+
+  /**
+   * Generate the message to be sent to another user.
+   *
+   * Arguments:
+   *   name: string
+   *   plaintext: string
+   *
+   * Return Type: Tuple of [dictionary, string]
+   */
 
   async sendMessage(name, plaintext) {    
     //generate rk / ck if user has not communicated with name before.
@@ -127,11 +167,10 @@ class MessengerClient {
       this.conns[name].skippedKeys = {};  // Changed to object to store keys by chain
       this.conns[name].N = 0
       this.conns[name].PN = 0
-      this.conns[name].messageKeys = new Set(); // Store message keys by chain and number
+      this.conns[name].messageKeys = new Map(); // Store message keys by chain and number
       this.conns[name].previousChain = null;
       
     } else if (!(this.conns[name].seenPks.has(header.pk_sender))) {
-
       // Save the current chain state before ratchet
       this.conns[name].previousChain = {
         ck_r: this.conns[name].ck_r,
@@ -145,34 +184,68 @@ class MessengerClient {
         for (let i = this.conns[name].N; i < header.PN; i++) {
           const mk = await HMACtoAESKey(chainCk, "mk-str");
           chainCk = await HMACtoHMACKey(chainCk, "ck-str");
-          this.conns[name].messageKeys.add(`prev:${i}`, mk);
+          this.conns[name].messageKeys.set(`prev:${i}`, mk);
         }
       }
 
+      // Perform DH ratchet
       const first_dh_output = await computeDH(this.myKeyPairs[name].sec_key, header.pk_sender);
-      let [rk_first, ck_r] = await HKDF(first_dh_output, this.conns[name].rk, "ratchet-salt"); //see Signal diagram
+      let [rk_first, ck_r] = await HKDF(first_dh_output, this.conns[name].rk, "ratchet-salt");
 
       const fresh_pair = await generateEG();
-      this.myKeyPairs[name] = {pub_key: fresh_pair.pub, sec_key: fresh_pair.sec}
+      this.myKeyPairs[name] = {pub_key: fresh_pair.pub, sec_key: fresh_pair.sec};
 
       const second_dh_output = await computeDH(this.myKeyPairs[name].sec_key, header.pk_sender);
-      const [rk, ck_s] = await HKDF(second_dh_output, rk_first, "ratchet-salt"); //see Signal diagram
+      const [rk, ck_s] = await HKDF(second_dh_output, rk_first, "ratchet-salt");
+      
       this.conns[name].rk = rk;
       this.conns[name].ck_s = ck_s;
       this.conns[name].ck_r = ck_r;
       this.conns[name].PN = this.conns[name].N;
       this.conns[name].N = 0;
 
+      // Store skipped messages in new chain
+      const skippedInNewChain = header.N;
+      if (skippedInNewChain > 0) {
+        let chainCk = this.conns[name].ck_r;
+        for (let i = 0; i < header.N; i++) {
+          const mk = await HMACtoAESKey(chainCk, "mk-str");
+          chainCk = await HMACtoHMACKey(chainCk, "ck-str");
+          this.conns[name].messageKeys.set(`curr:${i}`, mk);
+        }
+        this.conns[name].ck_r = chainCk;
+      }
+
+    } else {
+      // Handle skipped messages in current chain
+      const missed = header.N - this.conns[name].N;
+      if (missed > 0) {
+        let chainCk = this.conns[name].ck_r;
+        for (let i = this.conns[name].N; i < header.N; i++) {
+          const mk = await HMACtoAESKey(chainCk, "mk-str");
+          chainCk = await HMACtoHMACKey(chainCk, "ck-str");
+          this.conns[name].messageKeys.set(`curr:${i}`, mk);
+        }
+        this.conns[name].ck_r = chainCk;
+      }
     }
 
-    //Apply symmetric-key ratchet on receiving chain to get message key for the received message
-    const ck_r = await HMACtoHMACKey(this.conns[name].ck_r, "ck-str");
-    const mk = await HMACtoAESKey(this.conns[name].ck_r, "mk-str");
-    
-    //update ck_r and the public key of the last sender
-    this.conns[name].ck_r = ck_r;
-    this.conns[name].seenPks.add(header.pk_sender)
-    
+    // Try to use stored message key if available
+    let mk;
+    const keyId = this.conns[name].seenPks.has(header.pk_sender) 
+      ? `curr:${header.N}` 
+      : `prev:${header.N}`;
+
+    if (this.conns[name].messageKeys.has(keyId)) {
+      mk = this.conns[name].messageKeys.get(keyId);
+      this.conns[name].messageKeys.delete(keyId);
+    } else {
+      // Generate message key for current message
+      mk = await HMACtoAESKey(this.conns[name].ck_r, "mk-str");
+      this.conns[name].ck_r = await HMACtoHMACKey(this.conns[name].ck_r, "ck-str");
+    }
+
+    this.conns[name].seenPks.add(header.pk_sender);
     const plaintext = await decryptWithGCM(mk, ciphertext, header.receiverIV, JSON.stringify(header));
     this.conns[name].N = header.N + 1;
     return bufferToString(plaintext);
